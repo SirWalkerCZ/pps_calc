@@ -14,7 +14,7 @@ pip install -r requirements.txt
 3. Spusť skript:
 
 ```bash
-python ppsjefaktsuper.py
+python main.py
 ```
 
 Výstupy:
