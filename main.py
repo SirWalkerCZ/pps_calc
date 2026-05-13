@@ -2,6 +2,7 @@ import itertools
 import math
 import os
 import sys
+from io import BytesIO
 from typing import Any
 
 import requests
@@ -25,8 +26,11 @@ load_env_file()
 
 API_KEY = os.getenv("MAPY_API_KEY")
 GEOCODE_URL = "https://api.mapy.com/v1/geocode"
+ROUTE_URL = "https://api.mapy.com/v1/routing/route"
 EARTH_RADIUS_METERS = 6_371_000
 OUTPUT_DIR = "vystupy"
+MAP_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+MAP_ZOOM = 12
 MATRIX_URLS = [
     "https://api.mapy.com/v1/routing/matrix-m",
     "https://api.mapy.cz/v1/routing/matrix-m",
@@ -110,6 +114,18 @@ def load_matrix(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         raise ValueError(f"Neočekávaná odpověď maticového plánování: {data}")
 
     return matrix
+
+
+def load_route_geometry(start: dict[str, Any], end: dict[str, Any]) -> list[tuple[float, float]]:
+    data = api_get(
+        ROUTE_URL,
+        start=f"{start['lon']},{start['lat']}",
+        end=f"{end['lon']},{end['lat']}",
+        routeType="car_fast",
+        format="geojson",
+    )
+    coordinates = data["geometry"]["geometry"]["coordinates"]
+    return [(float(lon), float(lat)) for lon, lat in coordinates]
 
 
 def entry_length(entry: dict[str, Any]) -> float:
@@ -345,6 +361,78 @@ def route_to_edges(route: tuple[int, ...], return_to_start: bool = False) -> lis
     return edges
 
 
+def lon_to_tile_x(lon: float, zoom: int) -> int:
+    return int((lon + 180.0) / 360.0 * (2**zoom))
+
+
+def lat_to_tile_y(lat: float, zoom: int) -> int:
+    lat_rad = math.radians(lat)
+    return int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * (2**zoom))
+
+
+def tile_x_to_lon(tile_x: int, zoom: int) -> float:
+    return tile_x / (2**zoom) * 360.0 - 180.0
+
+
+def tile_y_to_lat(tile_y: int, zoom: int) -> float:
+    mercator = math.pi * (1 - 2 * tile_y / (2**zoom))
+    return math.degrees(math.atan(math.sinh(mercator)))
+
+
+def lon_lat_to_global_pixel(lon: float, lat: float, zoom: int) -> tuple[float, float]:
+    lat_rad = math.radians(lat)
+    scale = 256 * (2**zoom)
+    x = (lon + 180.0) / 360.0 * scale
+    y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * scale
+    return x, y
+
+
+def load_map_background(
+    coordinates: list[tuple[float, float]],
+    zoom: int = MAP_ZOOM,
+    padding_px: int = 512,
+):
+    from PIL import Image
+
+    pixels = [lon_lat_to_global_pixel(lon, lat, zoom) for lon, lat in coordinates]
+    min_pixel_x = min(x for x, _ in pixels) - padding_px
+    max_pixel_x = max(x for x, _ in pixels) + padding_px
+    min_pixel_y = min(y for _, y in pixels) - padding_px
+    max_pixel_y = max(y for _, y in pixels) + padding_px
+
+    min_x = math.floor(min_pixel_x / 256)
+    max_x = math.floor(max_pixel_x / 256)
+    min_y = math.floor(min_pixel_y / 256)
+    max_y = math.floor(max_pixel_y / 256)
+
+    width = (max_x - min_x + 1) * 256
+    height = (max_y - min_y + 1) * 256
+    background = Image.new("RGB", (width, height), "#f3efe8")
+
+    headers = {"User-Agent": "pocitame-vzdalenost/1.0"}
+    for tile_x in range(min_x, max_x + 1):
+        for tile_y in range(min_y, max_y + 1):
+            url = MAP_TILE_URL.format(z=zoom, x=tile_x, y=tile_y)
+            response = requests.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            tile = Image.open(BytesIO(response.content)).convert("RGB")
+            background.paste(tile, ((tile_x - min_x) * 256, (tile_y - min_y) * 256))
+
+    origin = (min_x * 256, min_y * 256)
+    return background, origin
+
+
+def to_local_pixel(lon: float, lat: float, origin: tuple[int, int], zoom: int = MAP_ZOOM) -> tuple[float, float]:
+    global_x, global_y = lon_lat_to_global_pixel(lon, lat, zoom)
+    return global_x - origin[0], global_y - origin[1]
+
+
+def route_midpoint(coordinates: list[tuple[float, float]]) -> tuple[float, float]:
+    if not coordinates:
+        return 0.0, 0.0
+    return coordinates[len(coordinates) // 2]
+
+
 def save_graph_image(
     filename: str,
     points: list[dict[str, Any]],
@@ -360,53 +448,103 @@ def save_graph_image(
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     output_path = os.path.join(OUTPUT_DIR, filename)
 
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, ax = plt.subplots(figsize=(16, 11))
 
-    lons = [point["lon"] for point in points]
-    lats = [point["lat"] for point in points]
+    route_geometries = {}
+    all_coordinates = [(point["lon"], point["lat"]) for point in points]
 
     for start, end in edges:
-        point_a = points[start]
-        point_b = points[end]
+        try:
+            coordinates = load_route_geometry(points[start], points[end])
+        except (requests.RequestException, KeyError, ValueError) as exc:
+            print(
+                f"Varování: nepodařilo se načíst geometrii trasy {points[start]['name']} - {points[end]['name']} ({exc}).",
+                file=sys.stderr,
+            )
+            coordinates = [
+                (points[start]["lon"], points[start]["lat"]),
+                (points[end]["lon"], points[end]["lat"]),
+            ]
+        route_geometries[(start, end)] = coordinates
+        all_coordinates.extend(coordinates)
+
+    map_loaded = False
+    origin = (0, 0)
+
+    try:
+        background, origin = load_map_background(all_coordinates)
+        ax.imshow(background, interpolation="bilinear", zorder=0)
+        map_loaded = True
+    except requests.RequestException as exc:
+        print(f"Varování: nepodařilo se načíst mapový podklad ({exc}). Kreslím čistý graf.", file=sys.stderr)
+
+    for start, end in edges:
+        coordinates = route_geometries[(start, end)]
+        route_pixels = [to_local_pixel(lon, lat, origin) for lon, lat in coordinates]
+        xs = [x for x, _ in route_pixels]
+        ys = [y for _, y in route_pixels]
         ax.plot(
-            [point_a["lon"], point_b["lon"]],
-            [point_a["lat"], point_b["lat"]],
+            xs,
+            ys,
             color="#1f77b4",
-            linewidth=2.8,
-            zorder=1,
+            linewidth=3.4,
+            alpha=0.95,
+            zorder=2,
         )
 
-        label_lon = (point_a["lon"] + point_b["lon"]) / 2
-        label_lat = (point_a["lat"] + point_b["lat"]) / 2
+        label_lon, label_lat = route_midpoint(coordinates)
+        label_x, label_y = to_local_pixel(label_lon, label_lat, origin)
         ax.text(
-            label_lon,
-            label_lat,
+            label_x,
+            label_y,
             f"{format_km(entry_length(matrix[start][end]))} km",
             fontsize=8,
             ha="center",
             va="center",
             bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "#d9d9d9", "alpha": 0.9},
-            zorder=3,
+            zorder=4,
         )
 
-    ax.scatter(lons, lats, s=140, color="#d62728", edgecolor="white", linewidth=1.5, zorder=4)
+    point_pixels = [to_local_pixel(point["lon"], point["lat"], origin) for point in points]
+    point_xs = [x for x, _ in point_pixels]
+    point_ys = [y for _, y in point_pixels]
+    ax.scatter(point_xs, point_ys, s=145, color="#d62728", edgecolor="white", linewidth=1.7, zorder=5)
     for index, point in enumerate(points, start=1):
+        point_x, point_y = to_local_pixel(point["lon"], point["lat"], origin)
         ax.annotate(
             f"{index}. {point['name']}",
-            (point["lon"], point["lat"]),
+            (point_x, point_y),
             xytext=(7, 7),
             textcoords="offset points",
             fontsize=10,
             weight="bold",
-            zorder=5,
+            bbox={"boxstyle": "round,pad=0.18", "facecolor": "white", "edgecolor": "none", "alpha": 0.78},
+            zorder=6,
         )
 
-    ax.set_xlabel("zeměpisná délka")
-    ax.set_ylabel("zeměpisná šířka")
-    ax.grid(True, color="#e6e6e6", linewidth=0.8)
-    ax.set_aspect("equal", adjustable="datalim")
+    all_pixels = [to_local_pixel(lon, lat, origin) for lon, lat in all_coordinates]
+    min_x = min(x for x, _ in all_pixels)
+    max_x = max(x for x, _ in all_pixels)
+    min_y = min(y for _, y in all_pixels)
+    max_y = max(y for _, y in all_pixels)
+    padding_x = max((max_x - min_x) * 0.14, 140)
+    padding_y = max((max_y - min_y) * 0.18, 140)
+    ax.set_xlim(min_x - padding_x, max_x + padding_x)
+    ax.set_ylim(max_y + padding_y, min_y - padding_y)
+    ax.axis("off")
+    if map_loaded:
+        ax.text(
+            0.01,
+            0.01,
+            "Map data © OpenStreetMap contributors",
+            transform=ax.transAxes,
+            fontsize=8,
+            color="#333333",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "none", "alpha": 0.75},
+            zorder=7,
+        )
     fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
+    fig.savefig(output_path, dpi=240)
     plt.close(fig)
 
     return output_path
