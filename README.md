@@ -1,6 +1,6 @@
 # Návrh přípojné sítě
 
-Skript počítá vzdálenostní matici pro variantu C zadání, hledá minimální strom a jeden kruh nad automobilovými vzdálenostmi z Mapy.com API a generuje obrázky do složky `vystupy`.
+Skript počítá vzdálenostní matici pro variantu C zadání, hledá minimální strom a jeden kruh nad vzdálenostmi pro pokládku optiky z Mapy.com API a generuje obrázky do složky `vystupy`.
 
 ## Spuštění
 
@@ -23,8 +23,9 @@ Výstupy:
 - `vystupy/jeden_kruh.png`
 - `vystupy/tab_vzdalenosti_auto.tex`
 - `vystupy/tab_casy_auto.tex`
-- `vystupy/tab_minimalni_strom_auto.tex`
-- `vystupy/tab_jeden_kruh_auto.tex`
+- `vystupy/tab_vzdalenosti_pokladka.tex`
+- `vystupy/tab_minimalni_strom_pokladka.tex`
+- `vystupy/tab_jeden_kruh_pokladka.tex`
 - `vystupy/tab_vzdalenosti_vzdusne.tex`
 
 Obrázky nemají vlastní nadpis, popisek patří až do LaTeXu:
@@ -42,7 +43,7 @@ Tabulky jsou uložené jako fragmenty pro `\input`:
 ```latex
 \begin{table}[htbp]
     \centering
-    \input{vystupy/tab_vzdalenosti_auto.tex}
-    \caption{Matice automobilových vzdáleností}
+    \input{vystupy/tab_vzdalenosti_pokladka.tex}
+    \caption{Matice vzdáleností pro pokládku}
 \end{table}
 ```

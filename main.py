@@ -53,6 +53,12 @@ GEOCODE_QUERY_OVERRIDES = {
     "Hředle": "Hředle u Rakovníka",
 }
 
+# Pro fyzickou pokládku optiky je možné u konkrétních hran uvažovat i cesty,
+# cyklostezky a polní/lesní komunikace, ne jen automobilové silnice.
+PHYSICAL_ROUTE_TYPE_OVERRIDES = {
+    frozenset(("Mšec", "Srby")): "bike_mountain",
+}
+
 
 def api_get(url: str, **params: Any) -> dict[str, Any]:
     response = requests.get(
@@ -116,16 +122,49 @@ def load_matrix(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return matrix
 
 
-def load_route_geometry(start: dict[str, Any], end: dict[str, Any]) -> list[tuple[float, float]]:
+def route_type_for_edge(start_name: str, end_name: str, default: str = "car_fast") -> str:
+    return PHYSICAL_ROUTE_TYPE_OVERRIDES.get(frozenset((start_name, end_name)), default)
+
+
+def load_route(start: dict[str, Any], end: dict[str, Any], route_type: str) -> dict[str, Any]:
     data = api_get(
         ROUTE_URL,
         start=f"{start['lon']},{start['lat']}",
         end=f"{end['lon']},{end['lat']}",
-        routeType="car_fast",
+        routeType=route_type,
         format="geojson",
     )
     coordinates = data["geometry"]["geometry"]["coordinates"]
-    return [(float(lon), float(lat)) for lon, lat in coordinates]
+    return {
+        "length": float(data["length"]),
+        "duration": float(data["duration"]),
+        "routeType": route_type,
+        "coordinates": [(float(lon), float(lat)) for lon, lat in coordinates],
+    }
+
+
+def load_route_geometry(start: dict[str, Any], end: dict[str, Any], route_type: str) -> list[tuple[float, float]]:
+    return load_route(start, end, route_type)["coordinates"]
+
+
+def build_physical_matrix(
+    points: list[dict[str, Any]],
+    names: list[str],
+    car_matrix: list[list[dict[str, Any]]],
+) -> list[list[dict[str, Any]]]:
+    matrix = [[dict(entry) for entry in row] for row in car_matrix]
+
+    for edge_names, route_type in PHYSICAL_ROUTE_TYPE_OVERRIDES.items():
+        start_name, end_name = tuple(edge_names)
+        start_index = names.index(start_name)
+        end_index = names.index(end_name)
+        route = load_route(points[start_index], points[end_index], route_type)
+        for a, b in [(start_index, end_index), (end_index, start_index)]:
+            matrix[a][b]["length"] = route["length"]
+            matrix[a][b]["duration"] = route["duration"]
+            matrix[a][b]["routeType"] = route_type
+
+    return matrix
 
 
 def entry_length(entry: dict[str, Any]) -> float:
@@ -285,6 +324,18 @@ def save_latex_edges_table(
         table_file.write("\n".join(lines))
 
     return output_path
+
+
+def print_route_type_overrides(names: list[str], matrix: list[list[dict[str, Any]]]) -> None:
+    if not PHYSICAL_ROUTE_TYPE_OVERRIDES:
+        return
+
+    print("\nUpravené fyzické trasy pro pokládku")
+    for edge_names, route_type in PHYSICAL_ROUTE_TYPE_OVERRIDES.items():
+        start_name, end_name = tuple(edge_names)
+        start_index = names.index(start_name)
+        end_index = names.index(end_name)
+        print(f"- {start_name} -- {end_name}: {format_km(entry_length(matrix[start_index][end_index]))} km ({route_type})")
 
 
 def route_distance(route: tuple[int, ...], matrix: list[list[dict[str, Any]]], return_to_start: bool) -> float:
@@ -455,7 +506,8 @@ def save_graph_image(
 
     for start, end in edges:
         try:
-            coordinates = load_route_geometry(points[start], points[end])
+            route_type = route_type_for_edge(points[start]["name"], points[end]["name"])
+            coordinates = load_route_geometry(points[start], points[end], route_type)
         except (requests.RequestException, KeyError, ValueError) as exc:
             print(
                 f"Varování: nepodařilo se načíst geometrii trasy {points[start]['name']} - {points[end]['name']} ({exc}).",
@@ -591,6 +643,7 @@ def main() -> int:
 
     names = [point["name"] for point in points]
     straight_matrix = build_straight_matrix(points)
+    physical_matrix = build_physical_matrix(points, names, matrix)
 
     print("Nalezená místa")
     for point in points:
@@ -632,45 +685,52 @@ def main() -> int:
         matrix,
         lambda entry: format_minutes(entry_duration(entry)),
     )
+    print_route_type_overrides(names, physical_matrix)
+    physical_distance_table = save_latex_matrix_table(
+        "tab_vzdalenosti_pokladka.tex",
+        names,
+        physical_matrix,
+        lambda entry: format_km(entry_length(entry)),
+    )
 
-    tree_edges, tree_distance = find_minimum_spanning_tree(matrix)
+    tree_edges, tree_distance = find_minimum_spanning_tree(physical_matrix)
     tree_image = save_graph_image(
         "minimalni_strom.png",
         points,
         tree_edges,
-        matrix,
+        physical_matrix,
     )
-    tree_table = save_latex_edges_table("tab_minimalni_strom_auto.tex", names, tree_edges, matrix)
-    print("\nMinimální strom autem")
+    tree_table = save_latex_edges_table("tab_minimalni_strom_pokladka.tex", names, tree_edges, physical_matrix)
+    print("\nMinimální strom pro pokládku")
     for start, end in tree_edges:
-        length = entry_length(matrix[start][end])
+        length = entry_length(physical_matrix[start][end])
         print(f"- {names[start]} -- {names[end]}: {format_km(length)} km")
     print(f"Celkem: {format_km(tree_distance)} km")
     print(f"Obrázek: {tree_image}")
 
-    route, distance = find_shortest_route(matrix, start_index=0, return_to_start=False)
+    route, distance = find_shortest_route(physical_matrix, start_index=0, return_to_start=False)
     route_names = " -> ".join(names[index] for index in route)
-    print("\nNejkratší trasa autem přes všechna místa")
+    print("\nNejkratší trasa pro pokládku přes všechna místa")
     print(f"{route_names}")
     print(f"Celkem: {format_km(distance)} km")
 
-    route, distance = find_shortest_route(matrix, start_index=0, return_to_start=True)
+    route, distance = find_shortest_route(physical_matrix, start_index=0, return_to_start=True)
     route_names = " -> ".join(names[index] for index in route)
     circle_edges = route_to_edges(route, return_to_start=True)
     circle_image = save_graph_image(
         "jeden_kruh.png",
         points,
         circle_edges,
-        matrix,
+        physical_matrix,
     )
-    circle_table = save_latex_edges_table("tab_jeden_kruh_auto.tex", names, circle_edges, matrix)
-    print("\nNejkratší okruh autem přes všechna místa")
+    circle_table = save_latex_edges_table("tab_jeden_kruh_pokladka.tex", names, circle_edges, physical_matrix)
+    print("\nNejkratší okruh pro pokládku přes všechna místa")
     print(f"{route_names} -> {names[route[0]]}")
     print(f"Celkem: {format_km(distance)} km")
     print(f"Obrázek: {circle_image}")
 
     print("\nLaTeX tabulky")
-    for table_path in [straight_table, car_distance_table, car_time_table, tree_table, circle_table]:
+    for table_path in [straight_table, car_distance_table, car_time_table, physical_distance_table, tree_table, circle_table]:
         print(f"- {table_path}")
 
     return 0
